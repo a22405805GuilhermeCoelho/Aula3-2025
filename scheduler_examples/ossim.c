@@ -19,7 +19,8 @@
 
 static uint32_t PID = 0;
 
-
+void sjf_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
+void rr_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
 
 /**
  * @brief Set up the server socket for the scheduler.
@@ -232,13 +233,7 @@ void check_blocked_queue(queue_t * blocked_queue, queue_t * command_queue, uint3
 }
 
 static const char *SCHEDULER_NAMES[] = {
-    "FIFO",
-/*
-    "SJF",
-    "RR",
-    "MLFQ",
-*/
-    NULL
+    "FIFO","SJF","RR","MLFQ",NULL
 };
 
 typedef enum  {
@@ -297,7 +292,7 @@ int main(int argc, char *argv[]) {
         check_new_commands(&command_queue, &blocked_queue, &ready_queue, server_fd, current_time_ms);
 
         if (current_time_ms%1000 == 0) {
-            printf("Current time: %d s\n", current_time_ms/1000);
+            printf("Current time: %d s\n", current_time_ms / 1000);
         }
         // Check the status of the PCBs in the blocked queue
         check_blocked_queue(&blocked_queue, &command_queue, current_time_ms);
@@ -310,6 +305,14 @@ int main(int argc, char *argv[]) {
             case SCHED_FIFO:
                 fifo_scheduler(current_time_ms, &ready_queue, &CPU);
                 break;
+            case SCHED_SJF:
+                sjf_scheduler(current_time_ms, &ready_queue, &CPU);
+                break;
+            case SCHED_RR:
+                rr_scheduler(current_time_ms, &ready_queue, &CPU);
+                break;
+
+
 
             default:
                 printf("Unknown scheduler type\n");

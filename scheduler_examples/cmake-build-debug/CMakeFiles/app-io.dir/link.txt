@@ -1,0 +1,1 @@
+/usr/bin/cc -g "CMakeFiles/app-io.dir/app-io.c.o" "CMakeFiles/app-io.dir/burst_queue.c.o" -o app-io 
