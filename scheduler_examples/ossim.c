@@ -30,6 +30,15 @@ void enqueue_mlfq(pcb_t *pcb);
 // Contador global de PIDs para atribuir identificadores únicos
 static uint32_t PID = 0;
 
+// Enum para mapear strings em índices internos
+typedef enum  {
+    NULL_SCHEDULER = -1,
+    SCHED_FIFO = 0,
+    SCHED_SJF,
+    SCHED_RR,
+    SCHED_MLFQ
+} scheduler_en;
+
 // Protótipos dos outros escalonadores
 void sjf_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
 void rr_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
@@ -156,11 +165,14 @@ void check_new_commands(queue_t *command_queue, queue_t *blocked_queue, queue_t 
 
             // ---------- NOVO: decidir fila conforme escalonador ----------
             // Se o escalonador ativo for MLFQ → adiciona ao nível 0
-            if (scheduler_type == 3 /* SCHED_MLFQ */) {
-                enqueue_mlfq(current_pcb);
-            } else {
-                // FIFO, SJF e RR usam a fila ready_queue normal
-                enqueue_pcb(ready_queue, current_pcb);
+            if (msg.request == PROCESS_REQUEST_RUN) {
+
+                if (scheduler_type == SCHED_MLFQ) {
+                    enqueue_mlfq(current_pcb);       // MLFQ: entra no nível 0
+                } else {
+                    enqueue_pcb(ready_queue, current_pcb); // FIFO/SJF/RR: fila normal
+                }
+
             }
             // -------------------------------------------------------------
 
@@ -239,14 +251,7 @@ static const char *SCHEDULER_NAMES[] = {
     "FIFO","SJF","RR","MLFQ",NULL
 };
 
-// Enum para mapear strings em índices internos
-typedef enum  {
-    NULL_SCHEDULER = -1,
-    SCHED_FIFO = 0,
-    SCHED_SJF,
-    SCHED_RR,
-    SCHED_MLFQ
-} scheduler_en;
+
 
 // Compara o nome do escalonador passado na linha de comandos
 scheduler_en get_scheduler(const char *name) {
