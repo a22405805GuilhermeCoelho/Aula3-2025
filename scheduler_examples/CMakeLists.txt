@@ -3,8 +3,24 @@ project(scheduling C)
 
 set(CMAKE_C_STANDARD 11)
 
-add_executable(scheduler ossim.c queue.c fifo.c sjf.c rr.c mlfq.c)
+# --- Simulador principal (scheduler) ---
+add_executable(scheduler
+        ossim.c
+        queue.c
+        fifo.c
+        sjf.c
+        rr.c
+        mlfq.c
+        burst_queue.c
+)
 
-add_executable(app app.c app-io.c)
+# --- Aplicação simples (sem I/O) ---
+add_executable(app
+        app.c
+)
 
-add_executable(app-io app-io.c burst_queue.c)
+# --- Aplicação com I/O (usa ficheiros CSV) ---
+add_executable(app-io
+        app-io.c
+        burst_queue.c
+)

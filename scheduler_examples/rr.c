@@ -1,29 +1,34 @@
-
 #include "queue.h"
 #include "msg.h"
 #include <stdlib.h>
-#include <stdio.h>    // perror
-#include <unistd.h>   // write
+#include <stdio.h>    // para perror
+#include <unistd.h>   // para write()
 
-#define TIME_SLICE 500 // 500 ms
+#define TIME_SLICE 500 // quantum fixo de 500 ms para cada processo
 
 /**
- * Round-Robin (RR)
- * - Cada processo usa o CPU no máximo TIME_SLICE (500ms).
- * - Se acabar antes do slice → envia DONE e sai.
- * - Se o slice expirar e houver processos a aguardar → preempta e volta à fila (tail).
- * - Se o slice expirar e NÃO houver ninguém a aguardar → continua o mesmo processo (novo slice).
+ * Algoritmo Round-Robin (RR)
+ *
+ * Este escalonador atribui a cada processo um tempo máximo de execução (TIME_SLICE).
+ * Quando o tempo se esgota, o processo perde o CPU e volta ao fim da fila,
+ * garantindo que todos os processos tenham acesso regular à CPU.
+ *
+ * Resumo do comportamento:
+ *  - Se o processo terminar antes de esgotar o slice → envia DONE e é removido.
+ *  - Se o slice terminar e houver processos na fila → o processo atual é preemptado e volta ao fim.
+ *  - Se o slice terminar e NÃO houver outros prontos → o mesmo processo continua (reinicia o slice).
  */
 void rr_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task) {
 
-    // 1) Atualizar processo atual (se existir)
+    // 1) Atualiza o processo que está a usar o CPU (caso exista)
     if (*cpu_task) {
-        // Conta o tempo de CPU usado neste tick
+        // Acrescenta o tempo que o processo já executou neste tick
         (*cpu_task)->ellapsed_time_ms += TICKS_MS;
 
-        // 1.a) Terminou o trabalho total?
+        // 1.a) Verifica se já executou todo o seu tempo total
         if ((*cpu_task)->ellapsed_time_ms >= (*cpu_task)->time_ms) {
-            // -> Notifica a app que terminou (OBRIGATÓRIO para a app sair)
+            // O processo terminou a execução
+            // Envia mensagem DONE para a aplicação correspondente
             msg_t msg = {
                 .pid = (*cpu_task)->pid,
                 .request = PROCESS_REQUEST_DONE,
@@ -33,31 +38,31 @@ void rr_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task) {
                 perror("write");
             }
 
-            // Liberta o PCB e marca CPU livre
+            // Liberta a memória do PCB e marca o CPU como livre
             free(*cpu_task);
             *cpu_task = NULL;
         }
-        // 1.b) Não terminou: slice expirou?
+        // 1.b) Caso ainda não tenha terminado, verifica se o slice expirou
         else if ((current_time_ms - (*cpu_task)->slice_start_ms) >= TIME_SLICE) {
-            // Se não há ninguém na ready queue, não faz sentido preemptar
+            // Se não há mais processos prontos, o mesmo processo continua
             if (rq->head == NULL) {
-                // Recomeça um novo slice para o MESMO processo
+                // Reinicia o contador de slice para o mesmo processo
                 (*cpu_task)->slice_start_ms = current_time_ms;
             } else {
-                // Há gente à espera -> preempção:
+                // Há outros processos na fila → preempção
                 // Move o processo atual para o fim da fila e liberta o CPU
                 enqueue_pcb(rq, *cpu_task);
                 *cpu_task = NULL;
-                // (Nota: o slice_start_ms será atualizado quando voltar ao CPU)
+                // O slice_start_ms será atualizado quando o processo voltar ao CPU
             }
         }
     }
 
-    // 2) Se o CPU está livre, despacha próximo processo da ready queue
+    // 2) Caso o CPU esteja livre, retira o próximo processo da ready queue
     if (*cpu_task == NULL) {
         *cpu_task = dequeue_pcb(rq);
         if (*cpu_task) {
-            // Início de um novo time-slice para este processo
+            // Regista o início do novo slice para o processo agora escolhido
             (*cpu_task)->slice_start_ms = current_time_ms;
         }
     }

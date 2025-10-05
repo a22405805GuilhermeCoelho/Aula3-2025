@@ -1,36 +1,30 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <time.h>
 
+#include "queue.h"
+#include "msg.h"
+#include "fifo.h"
 #include "debug.h"
 
-#define MAX_CLIENTS 128
+// Protótipos dos diferentes escalonadores
+void sjf_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
+void rr_scheduler (uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
 
-#include <stdlib.h>
-#include <sys/errno.h>
-
-#include "fifo.h"
-
-#include "msg.h"
-#include "queue.h"
-
-// ---------- NOVO: protótipos MLFQ ----------
-// Declaração das funções implementadas em mlfq.c
-// - mlfq_init() inicializa as filas do MLFQ
-// - mlfq_scheduler() gere a execução dos processos entre níveis
-// - enqueue_mlfq() adiciona novos processos no nível mais alto
+// Funções específicas do MLFQ (definidas em mlfq.c)
 void mlfq_init(void);
-void mlfq_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
 void enqueue_mlfq(pcb_t *pcb);
-// -------------------------------------------
+void mlfq_scheduler(uint32_t current_time_ms, queue_t *rq /*unused*/, pcb_t **cpu_task);
 
-// Contador global de PIDs para atribuir identificadores únicos
-static uint32_t PID = 0;
-
-// Enum para mapear strings em índices internos
+// Enum que representa o escalonador ativo
 typedef enum  {
     NULL_SCHEDULER = -1,
     SCHED_FIFO = 0,
@@ -39,311 +33,320 @@ typedef enum  {
     SCHED_MLFQ
 } scheduler_en;
 
-// Protótipos dos outros escalonadores
-void sjf_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
-void rr_scheduler(uint32_t current_time_ms, queue_t *rq, pcb_t **cpu_task);
+static const char *SCHEDULER_NAMES[] = {"FIFO","SJF","RR","MLFQ",NULL};
 
-/**
- * @brief Cria e configura o socket servidor do escalonador.
- *
- * Esta função cria um socket UNIX para comunicação com as aplicações (apps),
- * faz o bind ao caminho /tmp/scheduler.sock e coloca-o em modo não bloqueante.
- * Retorna o descritor do socket para ser usado no loop principal.
- */
-int setup_server_socket(const char *socket_path) {
-    int server_fd;
-    struct sockaddr_un addr;
+// ---------------------------------------------------------
+// Funções utilitárias
+// ---------------------------------------------------------
 
-    // Apaga o socket antigo, se existir
-    unlink(socket_path);
+// Define um descritor de ficheiro como “non-blocking” (não bloqueante)
+// Isto permite que o servidor continue a correr mesmo que não haja mensagens.
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
-    // Cria o socket UNIX
-    if ((server_fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+// Variável global que serve para terminar o programa com Ctrl+C
+static volatile sig_atomic_t g_stop = 0;
+static void on_sigint(int sig) { (void)sig; g_stop = 1; }
+
+// ---------------------------------------------------------
+// Criação do socket servidor UNIX
+// ---------------------------------------------------------
+static int make_server_socket(const char *path) {
+    // Remove sockets antigos que possam existir
+    unlink(path);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
         perror("socket");
         return -1;
     }
 
-    // Inicializa estrutura de endereço e define caminho
-    memset(&addr, 0, sizeof(struct sockaddr_un));
+    struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path)-1);
 
-    // Faz o bind (liga o socket ao caminho)
-    if (bind(server_fd, (struct sockaddr *) &addr, sizeof(struct sockaddr_un)) < 0) {
+    // Associa o socket ao caminho (bind)
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
-        close(server_fd);
+        close(fd);
         return -1;
     }
 
-    // Coloca o socket em modo de escuta (aceitar conexões)
-    if (listen(server_fd, MAX_CLIENTS) < 0) {
+    // Coloca o socket a “escutar” novas ligações
+    if (listen(fd, 32) < 0) {
         perror("listen");
-        close(server_fd);
+        close(fd);
         return -1;
     }
 
-    // Define modo não bloqueante
-    int flags = fcntl(server_fd, F_GETFL, 0);
-    if (flags != -1) {
-        if (fcntl(server_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            perror("fcntl: set non-blocking");
-        }
-    }
-    return server_fd;
+    // Define o socket como não bloqueante
+    set_nonblocking(fd);
+    return fd;
 }
 
-// ---------- ALTERADO: passa scheduler_type para sabermos se usamos MLFQ ----------
-// Função responsável por:
-//  - aceitar novas ligações (novos processos/apps);
-//  - ler mensagens enviadas pelas apps (RUN ou BLOCK);
-//  - mover processos para as filas correspondentes (ready, blocked ou MLFQ).
-void check_new_commands(queue_t *command_queue, queue_t *blocked_queue, queue_t *ready_queue,
-                        int server_fd, uint32_t current_time_ms, int scheduler_type) {
-    int client_fd;
-    do {
-        // Aceita novas conexões de clientes (apps)
-        client_fd = accept(server_fd, NULL, NULL);
-        if (client_fd < 0) {
-            // Trata vários erros possíveis
-            if (errno == EMFILE || errno == ENFILE) { perror("accept: too many fds"); break; }
-            if (errno == EINTR)        continue; // interrupção → tenta de novo
-            if (errno == ECONNABORTED) continue; // handshake falhou → ignora
-            if ((errno != EAGAIN) && (errno != EWOULDBLOCK)) { perror("accept"); }
+// ---------------------------------------------------------
+// Leitura de mensagens dos clientes (apps)
+// ---------------------------------------------------------
+static int read_msg_nonblock(int sockfd, msg_t *out) {
+    ssize_t n = recv(sockfd, out, sizeof(*out), MSG_DONTWAIT);
+    if (n == 0) {
+        // O cliente fechou a ligação
+        return 0;
+    }
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return -2; // nada para ler agora
+        return -1; // erro real
+    }
+    if ((size_t)n != sizeof(*out)) return -1;
+    return 1; // leitura bem sucedida
+}
+
+// ---------------------------------------------------------
+// Filas usadas no simulador:
+//   - command_q: sockets ligados (para receber pedidos)
+//   - ready_q:   processos prontos (usado por FIFO/SJF/RR)
+//   - blocked_q: processos bloqueados (I/O em curso)
+//   - cpu_task:  processo em execução no CPU
+// ---------------------------------------------------------
+
+/**
+ * Aceita novas ligações e trata mensagens RUN/BLOCK de todas as ligações ativas.
+ *
+ * RUN  → envia ACK e adiciona o processo à fila certa:
+ *          - MLFQ → enqueue_mlfq(p)
+ *          - restantes → enqueue_pcb(ready_q, p)
+ *
+ * BLOCK → envia ACK e coloca o processo em blocked_q.
+ *
+ * Cada ligação mantém um PCB “de comando” apenas para guardar o socket ativo.
+ */
+static void check_new_commands(queue_t *command_q,
+                               queue_t *blocked_q,
+                               queue_t *ready_q,
+                               int server_fd,
+                               uint32_t now_ms,
+                               scheduler_en scheduler)
+{
+    // 1) Aceitar novas ligações (modo não bloqueante)
+    while (1) {
+        int client = accept(server_fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            perror("accept");
             break;
         }
+        set_nonblocking(client);
 
-        // Configura o socket do cliente como não bloqueante
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        if (flags != -1) {
-            if (fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-                perror("fcntl: set non-blocking");
-            }
-        }
+        // Cria um PCB apenas para representar esta ligação (comando)
+        pcb_t *cmd = new_pcb(-1, (uint32_t)client, 0);
+        if (!cmd) { close(client); continue; }
+        cmd->status = TASK_COMMAND;
+        enqueue_pcb(command_q, cmd);
+        DBG("New client connected (fd=%d)", client);
+    }
 
-        // Define flag close-on-exec (fecha em exec() de outro programa)
-        int fdflags = fcntl(client_fd, F_GETFD, 0);
-        if (fdflags != -1) {
-            fcntl(client_fd, F_SETFD, fdflags | FD_CLOEXEC);
-        }
+    // 2) Lê mensagens de todos os sockets ligados (sem remover da queue)
+    for (queue_elem_t *it = command_q->head; it != NULL; it = it->next) {
+        pcb_t *cmd = it->pcb;
+        if (!cmd) continue;
 
-        // Mostra informação de debug (nova ligação)
-        DBG("[Scheduler] New client connected: fd=%d\n", client_fd);
-
-        // Cria uma nova estrutura PCB para o processo recém-conectado
-        pcb_t *pcb = new_pcb(++PID, client_fd, 0);
-        // Adiciona-o à fila de comandos (ainda sem pedido RUN)
-        enqueue_pcb(command_queue, pcb);
-    } while (client_fd > 0);
-
-    // Percorre a fila de comandos à procura de mensagens das apps
-    queue_elem_t * elem = command_queue->head;
-    while (elem != NULL) {
-        pcb_t *current_pcb = elem->pcb;
         msg_t msg;
-        int n = read(current_pcb->sockfd, &msg, sizeof(msg_t));
-
-        // Se não há dados disponíveis ou o cliente fechou
-        if (n <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                elem = elem->next;
+        int r = read_msg_nonblock((int)cmd->sockfd, &msg);
+        if (r == -2) continue;     // nada para ler neste tick
+        if (r <= 0) {
+            if (r == 0) {
+                DBG("Client fd=%d closed connection", (int)cmd->sockfd);
             } else {
-                if (n < 0) perror("read"); else DBG("Connection closed by remote host\n");
-                queue_elem_t *tmp = elem;
-                elem = elem->next;
-                free(current_pcb);
-                free(tmp);
+                perror("read");
             }
+            close((int)cmd->sockfd);
+            cmd->sockfd = (uint32_t)-1;
             continue;
         }
 
-        // Mensagem RUN → processo pronto para executar
+        // Envia resposta imediata (ACK) a cada pedido recebido
+        msg_t ack = {
+            .pid = msg.pid,
+            .request = PROCESS_REQUEST_ACK,
+            .time_ms = now_ms
+        };
+        if (write((int)cmd->sockfd, &ack, sizeof(ack)) != sizeof(ack)) {
+            perror("write(ACK)");
+            continue;
+        }
+
+        // Tratamento do pedido recebido
         if (msg.request == PROCESS_REQUEST_RUN) {
-            current_pcb->pid = msg.pid;
-            current_pcb->time_ms = msg.time_ms;
-            current_pcb->ellapsed_time_ms = 0;
-            current_pcb->status = TASK_RUNNING;
+            // Cria um novo PCB para este burst de execução
+            pcb_t *p = new_pcb(msg.pid, cmd->sockfd, msg.time_ms);
+            if (!p) continue;
+            p->status = TASK_RUNNING;
+            p->ellapsed_time_ms = 0;
+            p->slice_start_ms = 0;
 
-            // ---------- NOVO: decidir fila conforme escalonador ----------
-            // Se o escalonador ativo for MLFQ → adiciona ao nível 0
-            if (msg.request == PROCESS_REQUEST_RUN) {
+            if (scheduler == SCHED_MLFQ) {
+                enqueue_mlfq(p); // MLFQ gere internamente as suas filas
+            } else {
+                enqueue_pcb(ready_q, p);
+            }
 
-                if (scheduler_type == SCHED_MLFQ) {
-                    enqueue_mlfq(current_pcb);       // MLFQ: entra no nível 0
-                } else {
-                    enqueue_pcb(ready_queue, current_pcb); // FIFO/SJF/RR: fila normal
+            DBG("Process %d requested RUN for %u ms", p->pid, p->time_ms);
+        }
+        else if (msg.request == PROCESS_REQUEST_BLOCK) {
+            // O processo pediu I/O → vai para a fila de bloqueados
+            pcb_t *p = new_pcb(msg.pid, cmd->sockfd, msg.time_ms);
+            if (!p) continue;
+            p->status = TASK_BLOCKED;
+            p->ellapsed_time_ms = 0;
+            p->last_update_time_ms = now_ms;
+            enqueue_pcb(blocked_q, p);
+
+            DBG("Process %d requested BLOCK for %u ms", p->pid, p->time_ms);
+        }
+        else {
+            // Pedido não reconhecido (segurança extra)
+            DBG("Unexpected request from pid=%d type=%d", (int)msg.pid, (int)msg.request);
+        }
+    }
+}
+
+/**
+ * Atualiza os processos bloqueados (I/O).
+ * Quando o tempo de bloqueio termina, envia uma mensagem DONE ao processo
+ * e remove-o da lista de bloqueados.
+ */
+static void check_blocked_queue(queue_t *blocked_q, uint32_t now_ms) {
+    queue_elem_t *it = blocked_q->head;
+    while (it) {
+        pcb_t *p = it->pcb;
+        if (p && p->status == TASK_BLOCKED) {
+            p->ellapsed_time_ms += TICKS_MS;
+
+            if (p->ellapsed_time_ms >= p->time_ms) {
+                // O processo terminou o I/O → envia DONE
+                msg_t done = {
+                    .pid = p->pid,
+                    .request = PROCESS_REQUEST_DONE,
+                    .time_ms = now_ms
+                };
+                if (write((int)p->sockfd, &done, sizeof(done)) != sizeof(done)) {
+                    perror("write(DONE:BLOCK)");
                 }
 
+                // Remove da fila sem quebrar o iterador
+                queue_elem_t *to_remove = it;
+                it = it->next;
+                queue_elem_t *removed = remove_queue_elem(blocked_q, to_remove);
+                if (removed) {
+                    free(removed->pcb);
+                    free(removed);
+                }
+                continue;
             }
-            // -------------------------------------------------------------
-
-            DBG("Process %d requested RUN for %d ms\n", current_pcb->pid, current_pcb->time_ms);
         }
-        // Mensagem BLOCK → processo vai para fila bloqueada (I/O)
-        else if (msg.request == PROCESS_REQUEST_BLOCK) {
-            current_pcb->pid = msg.pid;
-            current_pcb->time_ms = msg.time_ms;
-            current_pcb->status = TASK_BLOCKED;
-            enqueue_pcb(blocked_queue, current_pcb);
-            DBG("Process %d requested BLOCK for %d ms\n", current_pcb->pid);
-        } else {
-            printf("Unexpected message received from client\n");
-            continue;
-        }
-
-        // Remove o elemento atual da fila de comandos
-        remove_queue_elem(command_queue, elem);
-        queue_elem_t *tmp = elem;
-        elem = elem->next;
-        free(tmp);
-
-        // Envia ACK (confirmação) de que recebeu o pedido
-        msg_t ack_msg = {
-            .pid = current_pcb->pid,
-            .request = PROCESS_REQUEST_ACK,
-            .time_ms = current_time_ms
-        };
-        if (write(current_pcb->sockfd, &ack_msg, sizeof(msg_t)) != sizeof(msg_t)) {
-            perror("write");
-        }
-        DBG("Send ACK message to process %d with time %d\n", current_pcb->pid, current_time_ms);
+        it = it->next;
     }
 }
 
-// Verifica a fila de bloqueados (I/O) e move processos terminados de volta à fila de comandos
-void check_blocked_queue(queue_t * blocked_queue, queue_t * command_queue, uint32_t current_time_ms) {
-    queue_elem_t * elem = blocked_queue->head;
-    while (elem != NULL) {
-        pcb_t *pcb = elem->pcb;
-
-        // Atualiza o tempo restante de I/O
-        if (pcb->last_update_time_ms < current_time_ms) {
-            if (pcb->time_ms > TICKS_MS) pcb->time_ms -= TICKS_MS;
-            else pcb->time_ms = 0;
-        }
-
-        // Quando o I/O termina → envia DONE e move para fila de comandos
-        if (pcb->time_ms == 0) {
-            msg_t msg = {
-                .pid = pcb->pid,
-                .request = PROCESS_REQUEST_DONE,
-                .time_ms = current_time_ms
-            };
-            if (write(pcb->sockfd, &msg, sizeof(msg_t)) != sizeof(msg_t)) {
-                perror("write");
-            }
-            DBG("Process %d finished BLOCK, sending DONE\n", pcb->pid);
-            pcb->status = TASK_COMMAND;
-            pcb->last_update_time_ms = current_time_ms;
-            enqueue_pcb(command_queue, pcb);
-
-            remove_queue_elem(blocked_queue, elem);
-            queue_elem_t *tmp = elem;
-            elem = elem->next;
-            free(tmp);
-        } else {
-            elem = elem->next;
-        }
-    }
-}
-
-// Lista dos nomes dos escalonadores disponíveis
-static const char *SCHEDULER_NAMES[] = {
-    "FIFO","SJF","RR","MLFQ",NULL
-};
-
-
-
-// Compara o nome do escalonador passado na linha de comandos
-scheduler_en get_scheduler(const char *name) {
-    for (int i = 0; SCHEDULER_NAMES[i] != NULL; i++) {
-        if (strcmp(name, SCHEDULER_NAMES[i]) == 0) {
-            return (scheduler_en)i;
-        }
-    }
-    printf("Scheduler %s not recognized. Available options are:\n", name);
-    for (int i = 0; SCHEDULER_NAMES[i] != NULL; i++) {
-        printf(" - %s\n", SCHEDULER_NAMES[i]);
-    }
+// ---------------------------------------------------------
+// Identificação do escalonador a usar
+// ---------------------------------------------------------
+static scheduler_en get_scheduler(const char *name) {
+    if (!name) return NULL_SCHEDULER;
+    if (!strcmp(name, "FIFO"))  return SCHED_FIFO;
+    if (!strcmp(name, "SJF"))   return SCHED_SJF;
+    if (!strcmp(name, "RR"))    return SCHED_RR;
+    if (!strcmp(name, "MLFQ"))  return SCHED_MLFQ;
     return NULL_SCHEDULER;
 }
 
+// ---------------------------------------------------------
+// Função principal do simulador (main)
+// ---------------------------------------------------------
 int main(int argc, char *argv[]) {
-    // Verifica se foi passado o nome do escalonador
     if (argc != 2) {
-        printf("Usage: %s <scheduler>\nScheduler options: FIFO|SJF|RR|MLFQ\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    // Identifica o escalonador a usar
-    scheduler_en scheduler_type = get_scheduler(argv[1]);
-    if (scheduler_type == NULL_SCHEDULER) {
+        fprintf(stderr, "Usage: %s <FIFO|SJF|RR|MLFQ>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    // Cria as três filas principais
-    queue_t command_queue = {.head = NULL, .tail = NULL};
-    queue_t ready_queue   = {.head = NULL, .tail = NULL};
-    queue_t blocked_queue = {.head = NULL, .tail = NULL};
-
-    // Ponteiro para o processo atualmente no CPU
-    pcb_t *CPU = NULL;
-
-    // ---------- NOVO: inicialização do MLFQ ----------
-    // Se o escalonador for MLFQ, inicializa as filas internas
-    if (scheduler_type == SCHED_MLFQ) {
-        mlfq_init();
+    scheduler_en scheduler_type = get_scheduler(argv[1]);
+    if (scheduler_type == NULL_SCHEDULER) {
+        fprintf(stderr, "Invalid scheduler '%s'. Use FIFO, SJF, RR or MLFQ.\n", argv[1]);
+        return EXIT_FAILURE;
     }
-    // -------------------------------------------------
 
-    // Cria o socket do escalonador
-    int server_fd = setup_server_socket(SOCKET_PATH);
-    if (server_fd < 0) {
-        fprintf(stderr, "Failed to set up server socket\n");
-        return 1;
-    }
+    signal(SIGINT, on_sigint);
+
+    int server_fd = make_server_socket(SOCKET_PATH);
+    if (server_fd < 0) return EXIT_FAILURE;
+
     printf("Scheduler server listening on %s...\n", SOCKET_PATH);
+    printf("Active scheduler: %s\n", SCHEDULER_NAMES[scheduler_type]);
 
+    // Estruturas principais
+    queue_t command_queue = {.head=NULL, .tail=NULL};
+    queue_t ready_queue   = {.head=NULL, .tail=NULL};
+    queue_t blocked_queue = {.head=NULL, .tail=NULL};
+    pcb_t *cpu_task = NULL;
+
+    if (scheduler_type == SCHED_MLFQ) {
+        mlfq_init(); // inicializa as filas internas do MLFQ
+    }
+
+    // Ciclo principal da simulação
     uint32_t current_time_ms = 0;
-    while (1) {
-        // Processa novos pedidos das aplicações
-        check_new_commands(&command_queue, &blocked_queue, &ready_queue, server_fd, current_time_ms, scheduler_type);
+    uint32_t last_print_s = 0;
 
-        // Mostra tempo atual de 1 em 1 segundo
-        if (current_time_ms%1000 == 0) {
-            printf("Current time: %d s\n", current_time_ms / 1000);
-        }
+    while (!g_stop) {
+        // 1) Receber pedidos novos das aplicações
+        check_new_commands(&command_queue, &blocked_queue, &ready_queue,
+                           server_fd, current_time_ms, scheduler_type);
 
-        // Atualiza processos bloqueados e move-os para a fila de comandos
-        check_blocked_queue(&blocked_queue, &command_queue, current_time_ms);
-        usleep(TICKS_MS * 1000/2);
+        // 2) Atualizar a fila de bloqueados
+        check_blocked_queue(&blocked_queue, current_time_ms);
 
-        // Volta a verificar novos comandos após o pequeno atraso
-        check_new_commands(&command_queue, &blocked_queue, &ready_queue, server_fd, current_time_ms, scheduler_type);
-
-        // Chama o escalonador correspondente
+        // 3) Executar o escalonador ativo
         switch (scheduler_type) {
             case SCHED_FIFO:
-                fifo_scheduler(current_time_ms, &ready_queue, &CPU);
+                fifo_scheduler(current_time_ms, &ready_queue, &cpu_task);
                 break;
             case SCHED_SJF:
-                sjf_scheduler(current_time_ms, &ready_queue, &CPU);
+                sjf_scheduler(current_time_ms, &ready_queue, &cpu_task);
                 break;
             case SCHED_RR:
-                rr_scheduler(current_time_ms, &ready_queue, &CPU);
+                rr_scheduler(current_time_ms, &ready_queue, &cpu_task);
                 break;
             case SCHED_MLFQ:
-                // MLFQ gere as suas próprias filas internas
-                mlfq_scheduler(current_time_ms, &ready_queue, &CPU);
+                mlfq_scheduler(current_time_ms, &ready_queue, &cpu_task);
                 break;
             default:
-                printf("Unknown scheduler type\n");
                 break;
         }
 
-        // Simula o avanço do tempo (tick)
-        usleep(TICKS_MS * 1000/2);
+        // 4) Mostrar tempo de simulação uma vez por segundo
+        if ((current_time_ms / 1000) != last_print_s) {
+            last_print_s = current_time_ms / 1000;
+            printf("Current time: %u s\n", last_print_s);
+            fflush(stdout);
+        }
+
+        // 5) Avançar o tempo da simulação (tick)
+        usleep(TICKS_MS * 1000);
         current_time_ms += TICKS_MS;
     }
 
-    return 0;
+    // Encerramento e limpeza final
+    close(server_fd);
+    unlink(SOCKET_PATH);
+
+    // Liberta memória das filas restantes
+    while (command_queue.head) free(dequeue_pcb(&command_queue));
+    while (ready_queue.head)   free(dequeue_pcb(&ready_queue));
+    while (blocked_queue.head) free(dequeue_pcb(&blocked_queue));
+    if (cpu_task) free(cpu_task);
+
+    return EXIT_SUCCESS;
 }
